@@ -1,7 +1,8 @@
 import os
 import logging
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+from collections import defaultdict
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,7 +12,7 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest
+from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # ──────────────────────────────────────────────
@@ -28,14 +29,19 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
-# Config — all values come from environment variables
-# Never hardcode credentials here
+# Config
 # ──────────────────────────────────────────────
 ALPACA_API_KEY     = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY  = os.environ.get("ALPACA_SECRET_KEY", "")
 PAPER              = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 WEBHOOK_PASSPHRASE = os.environ.get("WEBHOOK_PASSPHRASE", "")
 IS_PAPER           = "paper" in PAPER
+
+# ──────────────────────────────────────────────
+# Risk settings — edit these two numbers only
+# ──────────────────────────────────────────────
+DEFAULT_NOTIONAL   = 500      # $ to spend per buy signal (e.g. $500)
+PDT_WARN_LIMIT     = 3        # warn when day trades reach this number in a week
 
 if not all([ALPACA_API_KEY, ALPACA_SECRET_KEY, WEBHOOK_PASSPHRASE]):
     raise EnvironmentError(
@@ -60,6 +66,24 @@ CRYPTO_MAP = {
 }
 
 # ──────────────────────────────────────────────
+# PDT tracker (in-memory, resets on server restart)
+# Tracks how many round-trip day trades per day
+# ──────────────────────────────────────────────
+day_trade_log: dict = defaultdict(int)   # { "2026-05-11": 2 }
+
+def record_day_trade():
+    today = str(date.today())
+    day_trade_log[today] += 1
+    total_week = sum(day_trade_log.values())
+    log.info(f"Day trade recorded. Today: {day_trade_log[today]} | This week total: {total_week}")
+    if total_week >= PDT_WARN_LIMIT:
+        log.warning(
+            f"PDT WARNING: {total_week} day trades recorded this week. "
+            f"Limit is 3 in 5 days for accounts under $25,000. "
+            f"Consider pausing stock trading for the rest of the week."
+        )
+
+# ──────────────────────────────────────────────
 # Alpaca client
 # ──────────────────────────────────────────────
 client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=IS_PAPER)
@@ -68,12 +92,13 @@ client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=IS_PAPER)
 # Helpers
 # ──────────────────────────────────────────────
 def normalize_symbol(symbol: str) -> str:
-    """Convert TradingView symbol format to Alpaca format."""
     s = symbol.upper().strip()
     return CRYPTO_MAP.get(s, s)
 
+def is_crypto(symbol: str) -> bool:
+    return "/" in symbol
+
 def get_position(symbol: str):
-    """Get open position, returns None if flat. Handles crypto slash encoding."""
     try:
         encoded = symbol.replace("/", "%2F")
         return client.get_open_position(encoded)
@@ -83,12 +108,12 @@ def get_position(symbol: str):
             return None
         raise
 
+def get_account():
+    return client.get_account()
+
 def is_market_open() -> bool:
     clock = client.get_clock()
     return clock.is_open
-
-def get_account():
-    return client.get_account()
 
 def cancel_open_orders(symbol: str):
     orders = client.get_orders()
@@ -98,97 +123,109 @@ def cancel_open_orders(symbol: str):
             log.info(f"Cancelled open order {order.id} for {symbol}")
 
 # ──────────────────────────────────────────────
-# Order logic
+# Core order logic
 # ──────────────────────────────────────────────
-def place_order(symbol: str, side: str, qty: float, order_type: str = "market",
-                limit_price: float = None, stop_price: float = None):
+def place_order(symbol: str, side: str, notional: float = None, qty: float = None):
+    """
+    Place a buy or sell order.
+
+    BUY logic:
+      - Uses notional (dollar amount) if provided, otherwise qty (shares/coins)
+      - Default notional = DEFAULT_NOTIONAL ($500)
+      - Skips if already holding this symbol (no doubling up)
+
+    SELL logic:
+      - Always sells the EXACT quantity currently held
+      - Skips safely if no position exists (never shorts accidentally)
+      - Records a day trade if buy and sell happen on same calendar day (stocks only)
+    """
 
     symbol = normalize_symbol(symbol)
     side   = side.lower().strip()
 
     if side not in ("buy", "sell"):
         raise ValueError(f"Invalid side '{side}'. Must be 'buy' or 'sell'.")
-    if qty <= 0:
-        raise ValueError(f"Invalid qty '{qty}'. Must be > 0.")
-
-    if not is_market_open():
-        log.warning(f"Market is CLOSED - order for {symbol} will queue.")
 
     account = get_account()
     if account.trading_blocked:
         raise RuntimeError("Account trading is blocked.")
 
-    log.info(f"Account buying power: ${float(account.buying_power):,.2f}")
+    buying_power = float(account.buying_power)
+    log.info(f"Account buying power: ${buying_power:,.2f}")
 
-    # Always-in flip logic
-    # qty from alert = desired position size
-    # if already in opposite position, flip by trading 2x qty
+    crypto = is_crypto(symbol)
+
+    # Stocks only — warn if market closed
+    if not crypto and not is_market_open():
+        log.warning(f"Market is CLOSED. Order for {symbol} will be queued for next open.")
+
     existing_position = get_position(symbol)
 
-    if existing_position:
+    # ── BUY ──────────────────────────────────
+    if side == "buy":
+        if existing_position:
+            held_qty = abs(float(existing_position.qty))
+            log.info(f"Already holding {held_qty} {symbol}. Skipping duplicate buy signal.")
+            return None
+
+        # Determine order amount — notional (dollars) takes priority over qty
+        spend = notional if notional else DEFAULT_NOTIONAL
+
+        if spend > buying_power:
+            raise RuntimeError(
+                f"Not enough buying power. Want to spend ${spend:,.2f} "
+                f"but only have ${buying_power:,.2f}."
+            )
+
+        log.info(f"Buying ${spend:,.2f} worth of {symbol}.")
+        cancel_open_orders(symbol)
+
+        order_data = MarketOrderRequest(
+            symbol=symbol,
+            notional=round(spend, 2),
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.GTC if crypto else TimeInForce.DAY,
+        )
+
+        order = client.submit_order(order_data)
+        log.info(
+            f"Order submitted | id={order.id} | BUY ${spend} of {symbol} | status={order.status}"
+        )
+        return order
+
+    # ── SELL ─────────────────────────────────
+    if side == "sell":
+        if not existing_position:
+            log.info(f"No position in {symbol}. Skipping sell signal — nothing to sell.")
+            return None
+
         held_qty  = abs(float(existing_position.qty))
         held_side = str(existing_position.side).lower()
 
-        if side == "buy":
-            if "long" in held_side:
-                order_qty = qty
-                log.info(f"Already LONG {held_qty} {symbol}. Adding {order_qty} more.")
-            else:
-                order_qty = held_qty + qty
-                log.info(f"Flipping SHORT {held_qty} to LONG {qty} {symbol}. Buying {order_qty}.")
-        else:
-            if "short" in held_side:
-                order_qty = qty
-                log.info(f"Already SHORT {held_qty} {symbol}. Selling {order_qty} more.")
-            else:
-                order_qty = held_qty + qty
-                log.info(f"Flipping LONG {held_qty} to SHORT {qty} {symbol}. Selling {order_qty}.")
-    else:
-        order_qty = qty
-        log.info(f"No position in {symbol}. Entering {side.upper()} {order_qty}.")
+        if "short" in held_side:
+            log.info(f"Position in {symbol} is already SHORT. Skipping sell signal.")
+            return None
 
-    cancel_open_orders(symbol)
+        log.info(f"Selling entire position: {held_qty} {symbol}.")
+        cancel_open_orders(symbol)
 
-    order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
-
-    if order_type == "market":
         order_data = MarketOrderRequest(
             symbol=symbol,
-            qty=order_qty,
-            side=order_side,
-            time_in_force=TimeInForce.GTC
+            qty=held_qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC if crypto else TimeInForce.DAY,
         )
-    elif order_type == "limit":
-        order_data = LimitOrderRequest(
-            symbol=symbol,
-            qty=order_qty,
-            side=order_side,
-            time_in_force=TimeInForce.GTC,
-            limit_price=limit_price
-        )
-    elif order_type == "stop":
-        order_data = StopOrderRequest(
-            symbol=symbol,
-            qty=order_qty,
-            side=order_side,
-            time_in_force=TimeInForce.GTC,
-            stop_price=stop_price
-        )
-    elif order_type == "stop_limit":
-        order_data = StopLimitOrderRequest(
-            symbol=symbol,
-            qty=order_qty,
-            side=order_side,
-            time_in_force=TimeInForce.GTC,
-            limit_price=limit_price,
-            stop_price=stop_price
-        )
-    else:
-        raise ValueError(f"Unknown order_type: {order_type}")
 
-    order = client.submit_order(order_data)
-    log.info(f"Order submitted | id={order.id} | {side.upper()} {order_qty}x {symbol} @ {order_type} | status={order.status}")
-    return order
+        order = client.submit_order(order_data)
+        log.info(
+            f"Order submitted | id={order.id} | SELL {held_qty}x {symbol} | status={order.status}"
+        )
+
+        # Record as day trade for stocks only (crypto has no PDT rule)
+        if not crypto:
+            record_day_trade()
+
+        return order
 
 # ──────────────────────────────────────────────
 # App
@@ -196,25 +233,33 @@ def place_order(symbol: str, side: str, qty: float, order_type: str = "market",
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Webhook server starting")
-    log.info(f"   Paper trading: {'YES' if IS_PAPER else 'NO - LIVE'}")
+    log.info(f"   Paper trading : {'YES' if IS_PAPER else 'NO - LIVE'}")
+    log.info(f"   Default spend : ${DEFAULT_NOTIONAL} per trade")
     yield
     log.info("Server shutting down")
 
 app = FastAPI(title="TradingView->Alpaca Webhook", lifespan=lifespan)
 
+# ──────────────────────────────────────────────
+# Routes
+# ──────────────────────────────────────────────
 @app.get("/health")
 def health():
     try:
         account = get_account()
         clock   = client.get_clock()
+        total_day_trades = sum(day_trade_log.values())
         return {
-            "status"      : "ok",
-            "market_open" : clock.is_open,
-            "next_open"   : str(clock.next_open),
-            "buying_power": str(account.buying_power),
-            "equity"      : str(account.equity),
-            "paper"       : IS_PAPER,
-            "timestamp"   : datetime.now(timezone.utc).isoformat(),
+            "status"          : "ok",
+            "market_open"     : clock.is_open,
+            "next_open"       : str(clock.next_open),
+            "buying_power"    : str(account.buying_power),
+            "equity"          : str(account.equity),
+            "paper"           : IS_PAPER,
+            "day_trades_week" : total_day_trades,
+            "pdt_warning"     : total_day_trades >= PDT_WARN_LIMIT,
+            "default_notional": DEFAULT_NOTIONAL,
+            "timestamp"       : datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
         log.error(f"Health check failed: {e}")
@@ -229,26 +274,31 @@ async def webhook(request: Request):
 
     log.info(f"Webhook received: {json.dumps(data)}")
 
+    # Passphrase check
     if data.get("passphrase") != WEBHOOK_PASSPHRASE:
-        log.warning("Bad passphrase")
+        log.warning("Bad passphrase — request rejected.")
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    missing = [f for f in ("symbol", "side", "qty") if f not in data]
+    # Required fields
+    missing = [f for f in ("symbol", "side") if f not in data]
     if missing:
         raise HTTPException(status_code=422, detail=f"Missing fields: {missing}")
 
+    # notional (dollars) takes priority over qty — both optional
+    # falls back to DEFAULT_NOTIONAL ($500) if neither provided
+    notional = float(data["notional"]) if "notional" in data else None
+    qty      = float(data["qty"])      if "qty"      in data else None
+
     try:
         order = place_order(
-            symbol      = data["symbol"],
-            side        = data["side"],
-            qty         = float(data["qty"]),
-            order_type  = data.get("order_type", "market"),
-            limit_price = data.get("limit_price"),
-            stop_price  = data.get("stop_price"),
+            symbol   = data["symbol"],
+            side     = data["side"],
+            notional = notional,
+            qty      = qty,
         )
 
         if order is None:
-            return JSONResponse({"status": "skipped", "reason": "no position to sell"})
+            return JSONResponse({"status": "skipped", "reason": "no action needed"})
 
         return JSONResponse({
             "status"      : "order_submitted",
@@ -310,3 +360,14 @@ def list_orders():
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/daytrades")
+def day_trades():
+    """Check how many day trades have been recorded this week."""
+    total = sum(day_trade_log.values())
+    return {
+        "log"         : dict(day_trade_log),
+        "total_week"  : total,
+        "pdt_warning" : total >= PDT_WARN_LIMIT,
+        "pdt_limit"   : PDT_WARN_LIMIT,
+    }
