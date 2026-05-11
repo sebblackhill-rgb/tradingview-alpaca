@@ -99,14 +99,43 @@ def is_crypto(symbol: str) -> bool:
     return "/" in symbol
 
 def get_position(symbol: str):
+    """
+    Look up an open position by symbol.
+    Tries multiple formats to handle Alpaca storing crypto as BTCUSD
+    internally even when ordered as BTC/USD, and vice versa.
+    """
+    # Build a list of formats to try
+    # e.g. BTC/USD -> also try BTCUSD and BTC%2FUSD
+    candidates = set()
+    candidates.add(symbol)
+    candidates.add(symbol.replace("/", ""))      # BTC/USD -> BTCUSD
+    candidates.add(symbol.replace("/", "%2F"))   # BTC/USD -> BTC%2FUSD
+
+    for candidate in candidates:
+        try:
+            pos = client.get_open_position(candidate)
+            if pos:
+                log.info(f"Found position for {symbol} using lookup key: {candidate}")
+                return pos
+        except Exception as e:
+            err = str(e).lower()
+            if "position does not exist" in err or "not found" in err or "404" in err:
+                continue
+            raise
+
+    # Final fallback — scan all positions and match by symbol loosely
     try:
-        encoded = symbol.replace("/", "%2F")
-        return client.get_open_position(encoded)
+        all_positions = client.get_all_positions()
+        symbol_clean = symbol.replace("/", "").upper()
+        for pos in all_positions:
+            pos_clean = pos.symbol.replace("/", "").upper()
+            if pos_clean == symbol_clean:
+                log.info(f"Found position for {symbol} via full scan: {pos.symbol}")
+                return pos
     except Exception as e:
-        err = str(e).lower()
-        if "position does not exist" in err or "not found" in err or "404" in err:
-            return None
-        raise
+        log.error(f"Error scanning all positions: {e}")
+
+    return None
 
 def get_account():
     return client.get_account()
@@ -116,9 +145,11 @@ def is_market_open() -> bool:
     return clock.is_open
 
 def cancel_open_orders(symbol: str):
+    symbol_clean = symbol.replace("/", "").upper()
     orders = client.get_orders()
     for order in orders:
-        if order.symbol == symbol:
+        order_clean = order.symbol.replace("/", "").upper()
+        if order_clean == symbol_clean:
             client.cancel_order_by_id(str(order.id))
             log.info(f"Cancelled open order {order.id} for {symbol}")
 
