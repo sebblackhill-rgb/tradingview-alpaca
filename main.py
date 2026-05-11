@@ -154,21 +154,51 @@ def cancel_open_orders(symbol: str):
             log.info(f"Cancelled open order {order.id} for {symbol}")
 
 # ──────────────────────────────────────────────
-# Core order logic
+# Core order logic — Always-In with Flip
 # ──────────────────────────────────────────────
+def submit(symbol: str, side: OrderSide, qty: float = None,
+           notional: float = None, crypto: bool = False):
+    """Submit a single market order. Use qty OR notional, not both."""
+    tif = TimeInForce.GTC if crypto else TimeInForce.DAY
+    if notional:
+        order_data = MarketOrderRequest(
+            symbol=symbol,
+            notional=round(notional, 2),
+            side=side,
+            time_in_force=tif,
+        )
+    else:
+        order_data = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            time_in_force=tif,
+        )
+    order = client.submit_order(order_data)
+    log.info(
+        f"Order submitted | id={order.id} | {side} "
+        f"{'$'+str(notional) if notional else str(qty)+'x'} {symbol} | status={order.status}"
+    )
+    return order
+
+
 def place_order(symbol: str, side: str, notional: float = None, qty: float = None):
     """
-    Place a buy or sell order.
+    Always-In Flip Logic — applied to ALL assets (stocks + crypto).
 
-    BUY logic:
-      - Uses notional (dollar amount) if provided, otherwise qty (shares/coins)
-      - Default notional = DEFAULT_NOTIONAL ($500)
-      - Skips if already holding this symbol (no doubling up)
+    BUY signal:
+      - No position       -> open $500 LONG
+      - Already LONG      -> skip (already in the right direction)
+      - Currently SHORT   -> close short + open $500 LONG
 
-    SELL logic:
-      - Always sells the EXACT quantity currently held
-      - Skips safely if no position exists (never shorts accidentally)
-      - Records a day trade if buy and sell happen on same calendar day (stocks only)
+    SELL signal:
+      - No position       -> open $500 SHORT
+      - Already SHORT     -> skip (already in the right direction)
+      - Currently LONG    -> close long + open $500 SHORT
+
+    PDT note: each flip on stocks counts as a day trade.
+    Short selling stocks requires the stock to be shortable on Alpaca.
+    If the short leg is rejected, the close leg still executes.
     """
 
     symbol = normalize_symbol(symbol)
@@ -185,78 +215,75 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
     log.info(f"Account buying power: ${buying_power:,.2f}")
 
     crypto = is_crypto(symbol)
+    spend  = notional if notional else DEFAULT_NOTIONAL
 
     # Stocks only — warn if market closed
     if not crypto and not is_market_open():
         log.warning(f"Market is CLOSED. Order for {symbol} will be queued for next open.")
 
-    existing_position = get_position(symbol)
+    if spend > buying_power:
+        raise RuntimeError(
+            f"Not enough buying power. Want ${spend:,.2f} but only have ${buying_power:,.2f}."
+        )
 
-    # ── BUY ──────────────────────────────────
+    cancel_open_orders(symbol)
+    existing = get_position(symbol)
+
+    orders_placed = []
+
+    # ── BUY signal ───────────────────────────
     if side == "buy":
-        if existing_position:
-            held_qty = abs(float(existing_position.qty))
-            log.info(f"Already holding {held_qty} {symbol}. Skipping duplicate buy signal.")
-            return None
+        if existing:
+            held_qty  = abs(float(existing.qty))
+            held_side = str(existing.side).lower()
 
-        # Determine order amount — notional (dollars) takes priority over qty
-        spend = notional if notional else DEFAULT_NOTIONAL
+            if "long" in held_side:
+                log.info(f"Already LONG {held_qty} {symbol}. Signal agrees — skipping.")
+                return None
 
-        if spend > buying_power:
-            raise RuntimeError(
-                f"Not enough buying power. Want to spend ${spend:,.2f} "
-                f"but only have ${buying_power:,.2f}."
+            if "short" in held_side:
+                # Close the short first
+                log.info(f"Closing SHORT {held_qty} {symbol} before opening LONG.")
+                close_order = submit(symbol, OrderSide.BUY, qty=held_qty, crypto=crypto)
+                orders_placed.append(close_order)
+                if not crypto:
+                    record_day_trade()
+
+        # Open long
+        log.info(f"Opening LONG ${spend} {symbol}.")
+        long_order = submit(symbol, OrderSide.BUY, notional=spend, crypto=crypto)
+        orders_placed.append(long_order)
+
+    # ── SELL signal ──────────────────────────
+    elif side == "sell":
+        if existing:
+            held_qty  = abs(float(existing.qty))
+            held_side = str(existing.side).lower()
+
+            if "short" in held_side:
+                log.info(f"Already SHORT {held_qty} {symbol}. Signal agrees — skipping.")
+                return None
+
+            if "long" in held_side:
+                # Close the long first
+                log.info(f"Closing LONG {held_qty} {symbol} before opening SHORT.")
+                close_order = submit(symbol, OrderSide.SELL, qty=held_qty, crypto=crypto)
+                orders_placed.append(close_order)
+                if not crypto:
+                    record_day_trade()
+
+        # Open short
+        log.info(f"Opening SHORT ${spend} {symbol}.")
+        try:
+            short_order = submit(symbol, OrderSide.SELL, notional=spend, crypto=crypto)
+            orders_placed.append(short_order)
+        except Exception as e:
+            log.warning(
+                f"SHORT order failed for {symbol} — stock may not be shortable. "
+                f"Long position closed but short not opened. Error: {e}"
             )
 
-        log.info(f"Buying ${spend:,.2f} worth of {symbol}.")
-        cancel_open_orders(symbol)
-
-        order_data = MarketOrderRequest(
-            symbol=symbol,
-            notional=round(spend, 2),
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC if crypto else TimeInForce.DAY,
-        )
-
-        order = client.submit_order(order_data)
-        log.info(
-            f"Order submitted | id={order.id} | BUY ${spend} of {symbol} | status={order.status}"
-        )
-        return order
-
-    # ── SELL ─────────────────────────────────
-    if side == "sell":
-        if not existing_position:
-            log.info(f"No position in {symbol}. Skipping sell signal — nothing to sell.")
-            return None
-
-        held_qty  = abs(float(existing_position.qty))
-        held_side = str(existing_position.side).lower()
-
-        if "short" in held_side:
-            log.info(f"Position in {symbol} is already SHORT. Skipping sell signal.")
-            return None
-
-        log.info(f"Selling entire position: {held_qty} {symbol}.")
-        cancel_open_orders(symbol)
-
-        order_data = MarketOrderRequest(
-            symbol=symbol,
-            qty=held_qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.GTC if crypto else TimeInForce.DAY,
-        )
-
-        order = client.submit_order(order_data)
-        log.info(
-            f"Order submitted | id={order.id} | SELL {held_qty}x {symbol} | status={order.status}"
-        )
-
-        # Record as day trade for stocks only (crypto has no PDT rule)
-        if not crypto:
-            record_day_trade()
-
-        return order
+    return orders_placed[-1] if orders_placed else None
 
 # ──────────────────────────────────────────────
 # App
