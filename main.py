@@ -38,9 +38,12 @@ WEBHOOK_PASSPHRASE = os.environ.get("WEBHOOK_PASSPHRASE", "")
 IS_PAPER           = "paper" in PAPER
 
 # ──────────────────────────────────────────────
-# Risk settings — edit these two numbers only
+# Risk settings
 # ──────────────────────────────────────────────
-DEFAULT_NOTIONAL   = 500      # $ to spend per buy signal (e.g. $500)
+DEFAULT_NOTIONAL   = 500      # fallback if alert doesn't specify
+TIER_A_NOTIONAL    = 2000     # Tier A = all filters agree (high confidence)
+TIER_B_NOTIONAL    = 1000     # Tier B = UT + RSI only (standard)
+MAX_NOTIONAL       = 5000     # safety cap — never spend more than this per signal
 PDT_WARN_LIMIT     = 3        # warn when day trades reach this number in a week
 
 if not all([ALPACA_API_KEY, ALPACA_SECRET_KEY, WEBHOOK_PASSPHRASE]):
@@ -217,6 +220,11 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
     crypto = is_crypto(symbol)
     spend  = notional if notional else DEFAULT_NOTIONAL
 
+    # Safety cap — never accidentally spend more than MAX_NOTIONAL on a single signal
+    if spend > MAX_NOTIONAL:
+        log.warning(f"Requested ${spend:,.2f} exceeds MAX_NOTIONAL ${MAX_NOTIONAL:,.2f}. Capping spend.")
+        spend = MAX_NOTIONAL
+
     # Stocks only — warn if market closed
     if not crypto and not is_market_open():
         log.warning(f"Market is CLOSED. Order for {symbol} will be queued for next open.")
@@ -291,8 +299,11 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Webhook server starting")
-    log.info(f"   Paper trading : {'YES' if IS_PAPER else 'NO - LIVE'}")
-    log.info(f"   Default spend : ${DEFAULT_NOTIONAL} per trade")
+    log.info(f"   Paper trading   : {'YES' if IS_PAPER else 'NO - LIVE'}")
+    log.info(f"   Tier A notional : ${TIER_A_NOTIONAL}")
+    log.info(f"   Tier B notional : ${TIER_B_NOTIONAL}")
+    log.info(f"   Default fallback: ${DEFAULT_NOTIONAL}")
+    log.info(f"   Max cap         : ${MAX_NOTIONAL}")
     yield
     log.info("Server shutting down")
 
@@ -317,6 +328,9 @@ def health():
             "day_trades_week" : total_day_trades,
             "pdt_warning"     : total_day_trades >= PDT_WARN_LIMIT,
             "default_notional": DEFAULT_NOTIONAL,
+            "tier_a_notional" : TIER_A_NOTIONAL,
+            "tier_b_notional" : TIER_B_NOTIONAL,
+            "max_notional"    : MAX_NOTIONAL,
             "timestamp"       : datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
