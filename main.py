@@ -243,18 +243,22 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
     Always-In Flip Logic — applied to ALL assets (stocks + crypto).
 
     BUY signal:
-      - No position       -> open $500 LONG
+      - No position       -> open LONG
       - Already LONG      -> skip (already in the right direction)
-      - Currently SHORT   -> close short + open $500 LONG
+      - Currently SHORT   -> close short + open LONG
 
     SELL signal:
-      - No position       -> open $500 SHORT
+      - No position       -> open SHORT
       - Already SHORT     -> skip (already in the right direction)
-      - Currently LONG    -> close long + open $500 SHORT
+      - Currently LONG    -> close long + open SHORT
 
     PDT note: each flip on stocks counts as a day trade.
     Short selling stocks requires the stock to be shortable on Alpaca.
     If the short leg is rejected, the close leg still executes.
+
+    Market hours note: outside market hours, stock flips are skipped entirely
+    because orders queue instead of fill, preventing the short leg from settling.
+    Crypto flips work 24/7.
     """
 
     symbol = normalize_symbol(symbol)
@@ -270,17 +274,14 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
     buying_power = float(account.buying_power)
     log.info(f"Account buying power: ${buying_power:,.2f}")
 
-    crypto = is_crypto(symbol)
-    spend  = notional if notional else DEFAULT_NOTIONAL
+    crypto       = is_crypto(symbol)
+    market_open  = crypto or is_market_open()
+    spend        = notional if notional else DEFAULT_NOTIONAL
 
     # Safety cap — never accidentally spend more than MAX_NOTIONAL on a single signal
     if spend > MAX_NOTIONAL:
         log.warning(f"Requested ${spend:,.2f} exceeds MAX_NOTIONAL ${MAX_NOTIONAL:,.2f}. Capping spend.")
         spend = MAX_NOTIONAL
-
-    # Stocks only — warn if market closed
-    if not crypto and not is_market_open():
-        log.warning(f"Market is CLOSED. Order for {symbol} will be queued for next open.")
 
     if spend > buying_power:
         raise RuntimeError(
@@ -303,6 +304,14 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                 return None
 
             if "short" in held_side:
+                # Stocks: only flip during market hours (orders need to fill, not queue)
+                if not market_open:
+                    log.warning(
+                        f"Market CLOSED. Cannot flip SHORT->LONG on {symbol} reliably "
+                        f"because close order will queue. Skipping signal entirely."
+                    )
+                    return None
+
                 # Close the short first
                 log.info(f"Closing SHORT {held_qty} {symbol} before opening LONG.")
                 close_order = submit(symbol, OrderSide.BUY, qty=held_qty, crypto=crypto)
@@ -313,6 +322,12 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                 wait_for_fill(str(close_order.id))
 
         # Open long
+        if not market_open:
+            log.warning(
+                f"Market CLOSED. Skipping fresh LONG entry on {symbol} "
+                f"(would queue until next open with uncertain fill price)."
+            )
+            return None
         log.info(f"Opening LONG ${spend} {symbol}.")
         long_order = submit(symbol, OrderSide.BUY, notional=spend, crypto=crypto)
         orders_placed.append(long_order)
@@ -328,6 +343,14 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                 return None
 
             if "long" in held_side:
+                # Stocks: only flip during market hours (orders need to fill, not queue)
+                if not market_open:
+                    log.warning(
+                        f"Market CLOSED. Cannot flip LONG->SHORT on {symbol} reliably "
+                        f"because close order will queue. Skipping signal entirely."
+                    )
+                    return None
+
                 # Close the long first
                 log.info(f"Closing LONG {held_qty} {symbol} before opening SHORT.")
                 close_order = submit(symbol, OrderSide.SELL, qty=held_qty, crypto=crypto)
@@ -341,6 +364,12 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
         # Open short
         # IMPORTANT: Alpaca rejects fractional notional shorts.
         # We must convert $ to whole shares using current market price.
+        if not market_open:
+            log.warning(
+                f"Market CLOSED. Skipping fresh SHORT entry on {symbol} "
+                f"(would queue until next open with uncertain fill price)."
+            )
+            return None
         try:
             if crypto:
                 # Alpaca paper doesn't support crypto shorts at all — let it fail gracefully
