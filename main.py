@@ -114,6 +114,36 @@ def get_current_price(symbol: str, crypto: bool) -> float:
         log.error(f"Failed to fetch current price for {symbol}: {e}")
         raise
 
+
+def wait_for_fill(order_id: str, max_wait_seconds: int = 8) -> bool:
+    """
+    Poll an order's status until it is FILLED, or until timeout.
+    Returns True if filled, False if it timed out or was rejected.
+    Used between flip legs so the close fully settles before the short.
+    """
+    import time
+    deadline = time.time() + max_wait_seconds
+    poll_interval = 0.4
+
+    while time.time() < deadline:
+        try:
+            order = client.get_order_by_id(order_id)
+            status = str(order.status).lower()
+
+            if "filled" in status and "partial" not in status:
+                log.info(f"Order {order_id} confirmed FILLED.")
+                return True
+            if "rejected" in status or "canceled" in status or "expired" in status:
+                log.warning(f"Order {order_id} ended in status: {status}")
+                return False
+        except Exception as e:
+            log.warning(f"Error polling order {order_id}: {e}")
+
+        time.sleep(poll_interval)
+
+    log.warning(f"Order {order_id} did not fill within {max_wait_seconds}s. Proceeding anyway.")
+    return False
+
 # ──────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────
@@ -279,6 +309,8 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                 orders_placed.append(close_order)
                 if not crypto:
                     record_day_trade()
+                # Wait for the close to settle before the new long opens
+                wait_for_fill(str(close_order.id))
 
         # Open long
         log.info(f"Opening LONG ${spend} {symbol}.")
@@ -302,6 +334,9 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                 orders_placed.append(close_order)
                 if not crypto:
                     record_day_trade()
+                # Wait for the close to settle before the short opens
+                # (Alpaca otherwise rejects the short because shares are "held for orders")
+                wait_for_fill(str(close_order.id))
 
         # Open short
         # IMPORTANT: Alpaca rejects fractional notional shorts.
