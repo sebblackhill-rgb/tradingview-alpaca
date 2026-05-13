@@ -14,6 +14,8 @@ from contextlib import asynccontextmanager
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest, CryptoLatestTradeRequest
 
 # ──────────────────────────────────────────────
 # Logging
@@ -90,6 +92,27 @@ def record_day_trade():
 # Alpaca client
 # ──────────────────────────────────────────────
 client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=IS_PAPER)
+
+# Data clients for fetching current prices (needed for whole-share short conversion)
+stock_data_client  = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+crypto_data_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+def get_current_price(symbol: str, crypto: bool) -> float:
+    """Fetch the latest trade price for a symbol. Used to convert $ to whole shares."""
+    try:
+        if crypto:
+            req = CryptoLatestTradeRequest(symbol_or_symbols=symbol)
+            trades = crypto_data_client.get_crypto_latest_trade(req)
+        else:
+            req = StockLatestTradeRequest(symbol_or_symbols=symbol)
+            trades = stock_data_client.get_stock_latest_trade(req)
+
+        # Response is dict keyed by symbol
+        for sym, trade in trades.items():
+            return float(trade.price)
+    except Exception as e:
+        log.error(f"Failed to fetch current price for {symbol}: {e}")
+        raise
 
 # ──────────────────────────────────────────────
 # Helpers
@@ -281,14 +304,36 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                     record_day_trade()
 
         # Open short
-        log.info(f"Opening SHORT ${spend} {symbol}.")
+        # IMPORTANT: Alpaca rejects fractional notional shorts.
+        # We must convert $ to whole shares using current market price.
         try:
-            short_order = submit(symbol, OrderSide.SELL, notional=spend, crypto=crypto)
-            orders_placed.append(short_order)
+            if crypto:
+                # Alpaca paper doesn't support crypto shorts at all — let it fail gracefully
+                log.info(f"Attempting SHORT ${spend} {symbol} (crypto shorts often rejected).")
+                short_order = submit(symbol, OrderSide.SELL, notional=spend, crypto=True)
+                orders_placed.append(short_order)
+            else:
+                # Stocks: convert $ to whole shares, then short by qty
+                current_price = get_current_price(symbol, crypto=False)
+                whole_shares  = int(spend / current_price)   # floor to whole number
+
+                if whole_shares < 1:
+                    log.warning(
+                        f"Cannot short {symbol}: ${spend} at ${current_price:.2f} "
+                        f"= less than 1 whole share. Skipping short leg."
+                    )
+                else:
+                    log.info(
+                        f"Opening SHORT {whole_shares} {symbol} "
+                        f"(${spend} ÷ ${current_price:.2f} = {whole_shares} whole shares)."
+                    )
+                    short_order = submit(symbol, OrderSide.SELL, qty=whole_shares, crypto=False)
+                    orders_placed.append(short_order)
         except Exception as e:
             log.warning(
-                f"SHORT order failed for {symbol} — stock may not be shortable. "
-                f"Long position closed but short not opened. Error: {e}"
+                f"SHORT order failed for {symbol} — stock may not be shortable or "
+                f"insufficient borrow available. Long position closed but short not opened. "
+                f"Error: {e}"
             )
 
     return orders_placed[-1] if orders_placed else None
