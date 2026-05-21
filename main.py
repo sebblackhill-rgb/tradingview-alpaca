@@ -52,6 +52,9 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 import requests as http_requests
 
+# Trade journal
+from trade_journal import TradeJournal
+
 # ──────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────
@@ -124,6 +127,18 @@ CRYPTO_MAP = {
 client             = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=IS_PAPER)
 stock_data_client  = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 crypto_data_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+# Trade journal — universal schema. On Railway the file is ephemeral but
+# still useful between restarts. For persistent storage, enable a Railway volume.
+try:
+    _account_id = client.get_account().account_number
+except Exception:
+    _account_id = "unknown"
+journal = TradeJournal(
+    bot_name="tradingview",
+    account_id=_account_id,
+    journal_path=Path("trade_journal.json"),
+)
 
 # ──────────────────────────────────────────────
 # In-memory bot state (best-effort persistence to STATE_FILE)
@@ -470,6 +485,12 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
         if _check_drawdown_halt():
             log.warning(f"Drawdown halt active — skipping BUY {symbol}.")
             send_telegram(f"⏸️ <b>TV Bot — Buy skipped</b>\n{symbol} BUY rejected (drawdown halt)")
+            try:
+                p = get_current_price(symbol, crypto)
+            except Exception:
+                p = 0.0
+            journal.log_skip(symbol, "drawdown_halt", price=p,
+                            metadata={"notional_requested": spend})
             return None
 
         if existing:
@@ -477,6 +498,12 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
             held_side = str(existing.side).lower()
             if "long" in held_side:
                 log.info(f"Already LONG {held_qty} {symbol}. Skipping duplicate buy.")
+                try:
+                    p = get_current_price(symbol, crypto)
+                except Exception:
+                    p = 0.0
+                journal.log_skip(symbol, "already_long", price=p,
+                                metadata={"held_qty": held_qty, "notional_requested": spend})
                 return None
             if "short" in held_side:
                 if not market_open:
@@ -491,6 +518,8 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
 
         if not market_open:
             log.warning(f"Market CLOSED. Skipping fresh LONG on {symbol}.")
+            journal.log_skip(symbol, "market_closed", price=0.0,
+                            metadata={"notional_requested": spend, "crypto": crypto})
             return None
 
         log.info(f"Opening LONG ${spend} {symbol}.")
@@ -512,6 +541,17 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                         "entry_price": price,
                     }
                 _save_state()
+                # Journal: log ENTRY
+                journal.log_entry(
+                    symbol=symbol, qty=spend / price, price=price,
+                    reason="tv_buy_signal",
+                    metadata={
+                        "notional": spend,
+                        "trailing_stop": stop,
+                        "atr": atr,
+                        "crypto": crypto,
+                    },
+                )
                 send_telegram(
                     f"🟢 <b>TV Bot — LONG opened</b>\n"
                     f"<b>{symbol}</b> @ ${price:.2f}\n"
@@ -534,6 +574,12 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
     elif side == "sell":
         if not existing:
             log.info(f"No position in {symbol}. Long-only: skipping sell signal.")
+            try:
+                p = get_current_price(symbol, crypto)
+            except Exception:
+                p = 0.0
+            journal.log_skip(symbol, "sell_no_position", price=p,
+                            metadata={})
             return None
 
         held_qty  = abs(float(existing.qty))
@@ -562,6 +608,16 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                     f"<b>{symbol}</b>: ${entry_price:.2f} → ${exit_price:.2f}\n"
                     f"Qty: {held_qty:.4f}\n"
                     f"PnL: ${pnl:+.2f} ({pnl_pct:+.2f}%)"
+                )
+                # Journal: log EXIT
+                journal.log_exit(
+                    symbol=symbol, qty=held_qty, price=exit_price, pnl=pnl,
+                    reason="tv_sell_signal",
+                    metadata={
+                        "entry_price": entry_price,
+                        "pnl_pct": pnl_pct,
+                        "crypto": crypto,
+                    },
                 )
             with _state_lock:
                 _state["trailing_stops"].pop(symbol, None)
@@ -609,6 +665,17 @@ def _close_position_now(symbol: str, reason: str):
                 f"<b>{symbol}</b>: ${entry_price:.2f} → ${exit_price:.2f}\n"
                 f"Qty: {held_qty:.4f}\n"
                 f"PnL: ${pnl:+.2f} ({pnl_pct:+.2f}%)"
+            )
+            # Journal: log EXIT (auto-close)
+            journal.log_exit(
+                symbol=symbol, qty=held_qty, price=exit_price, pnl=pnl,
+                reason=f"autoclose_{reason.split()[0].replace('@', 'stop').lower()}",
+                metadata={
+                    "entry_price": entry_price,
+                    "pnl_pct": pnl_pct,
+                    "auto_close_reason": reason,
+                    "crypto": crypto,
+                },
             )
         with _state_lock:
             _state["trailing_stops"].pop(symbol, None)
