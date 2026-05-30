@@ -41,7 +41,7 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import (
@@ -102,6 +102,10 @@ TRAILING_CHECK_SEC   = 60        # how often to check trailing stops
 # TIER 3 — Max hold + drawdown
 MAX_HOLD_DAYS        = 3         # close any position after N trading days
 DAILY_DRAWDOWN_LIMIT = 0.05      # 5% — auto-disable bot at this loss
+
+# EXTENDED HOURS — pre-market + after-hours trading
+ENABLE_EXTENDED_HOURS = True     # set False to revert to regular-hours-only
+EXT_LIMIT_BUFFER_PCT  = 0.01     # 1% limit-price buffer for extended-hours fills
 
 # Where we persist the bot's trading-state snapshot (Railway ephemeral, OK)
 STATE_FILE           = Path("bot_state.json")
@@ -330,6 +334,38 @@ def is_market_open() -> bool:
     return client.get_clock().is_open
 
 
+def get_market_session(crypto: bool) -> str:
+    """
+    Classify the current trading session for ENTRY decisions.
+      "crypto"   — 24/7, always tradeable
+      "regular"  — US regular hours (market clock says open)
+      "extended" — US pre-market or after-hours window
+      "closed"   — overnight or weekend, no trading possible
+
+    Uses a generous UTC window that covers both EST and EDT:
+      Pre-market  ~ 08:00–13:30 UTC
+      After-hours ~ 20:00–01:00 UTC
+    Weekends (Sat/Sun UTC) are always "closed".
+    """
+    if crypto:
+        return "crypto"
+    try:
+        if is_market_open():
+            return "regular"
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.weekday() >= 5:  # Sat/Sun
+            return "closed"
+        hour = now_utc.hour + now_utc.minute / 60.0
+        in_premarket  = 8.0 <= hour < 14.0
+        in_afterhours = 20.0 <= hour <= 23.999 or 0.0 <= hour < 1.0
+        if in_premarket or in_afterhours:
+            return "extended"
+        return "closed"
+    except Exception as e:
+        log.error(f"Error determining market session: {e}")
+        return "closed"
+
+
 def cancel_open_orders(symbol: str):
     symbol_clean = symbol.replace("/", "").upper()
     orders = client.get_orders()
@@ -408,7 +444,47 @@ def _check_drawdown_halt():
 # Order submission helper
 # ──────────────────────────────────────────────
 def submit(symbol: str, side: OrderSide, qty: float = None,
-           notional: float = None, crypto: bool = False):
+           notional: float = None, crypto: bool = False, session: str = "regular"):
+    """
+    Build and submit an order.
+
+    Regular hours / crypto -> MARKET order (notional or qty)
+    Extended hours stocks  -> LIMIT order with extended_hours=True and a
+                              1% price buffer. Alpaca requires limit orders
+                              for pre/post-market, and limit orders need an
+                              integer share qty (no notional, no fractions).
+    """
+    if session == "extended" and not crypto:
+        current_price = get_current_price(symbol, crypto=False)
+        buffer = current_price * EXT_LIMIT_BUFFER_PCT
+        if side == OrderSide.BUY:
+            limit_price = round(current_price + buffer, 2)
+            if notional and not qty:
+                qty = int(notional / current_price)
+        else:
+            limit_price = round(current_price - buffer, 2)
+            if qty:
+                qty = int(qty)  # extended-hours limit needs whole shares
+
+        if not qty or qty < 1:
+            raise ValueError(
+                f"Extended-hours order for {symbol} needs >=1 whole share "
+                f"(price ${current_price:.2f}). Skipping."
+            )
+
+        order_data = LimitOrderRequest(
+            symbol=symbol, qty=qty, side=side,
+            time_in_force=TimeInForce.DAY,
+            limit_price=limit_price, extended_hours=True,
+        )
+        order = client.submit_order(order_data)
+        log.info(
+            f"Order submitted | id={order.id} | {side} {qty}x {symbol} "
+            f"@ LIMIT ${limit_price} (ext-hours) | status={order.status}"
+        )
+        return order
+
+    # Regular hours or crypto -> market order
     tif = TimeInForce.GTC if crypto else TimeInForce.DAY
     if notional:
         order_data = MarketOrderRequest(
@@ -463,7 +539,16 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
     log.info(f"Account buying power: ${buying_power:,.2f}")
 
     crypto      = is_crypto(symbol)
-    market_open = crypto or is_market_open()
+    session     = get_market_session(crypto)
+    # Can we trade at all right now?
+    if session == "closed":
+        log.warning(f"Market CLOSED (overnight/weekend). Skipping {side.upper()} {symbol}.")
+        return None
+    if session == "extended" and not ENABLE_EXTENDED_HOURS:
+        log.warning(f"Extended hours disabled. Skipping {side.upper()} {symbol}.")
+        return None
+    # Tradeable in this session
+    market_open = session in ("regular", "extended", "crypto")
     spend       = notional if notional else DEFAULT_NOTIONAL
 
     if spend > MAX_NOTIONAL:
@@ -510,7 +595,7 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                     log.warning(f"Market CLOSED. Cannot close SHORT on {symbol}. Skipping.")
                     return None
                 log.info(f"Closing legacy SHORT {held_qty} {symbol} before opening LONG.")
-                close_order = submit(symbol, OrderSide.BUY, qty=held_qty, crypto=crypto)
+                close_order = submit(symbol, OrderSide.BUY, qty=held_qty, crypto=crypto, session=session)
                 orders_placed.append(close_order)
                 if not crypto:
                     record_day_trade()
@@ -522,8 +607,8 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                             metadata={"notional_requested": spend, "crypto": crypto})
             return None
 
-        log.info(f"Opening LONG ${spend} {symbol}.")
-        long_order = submit(symbol, OrderSide.BUY, notional=spend, crypto=crypto)
+        log.info(f"Opening LONG ${spend} {symbol} ({session}).")
+        long_order = submit(symbol, OrderSide.BUY, notional=spend, crypto=crypto, session=session)
         orders_placed.append(long_order)
 
         # TIER 2 — wait for fill so we can initialize trailing stop at actual entry
@@ -592,9 +677,21 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
             if not market_open:
                 log.warning(f"Market CLOSED. Cannot close LONG on {symbol}. Skipping.")
                 return None
+            # Extended-hours sells are LIMIT orders requiring whole shares.
+            # If the position is fractional, defer the close to regular hours
+            # so we don't strand a fractional remainder.
+            if session == "extended" and not crypto and held_qty != int(held_qty):
+                log.warning(
+                    f"{symbol}: fractional position ({held_qty}) can't be cleanly closed "
+                    f"with an extended-hours limit order. Deferring close to regular hours."
+                )
+                journal.log_skip(symbol, "sell_deferred_fractional_exthours",
+                                price=get_current_price(symbol, crypto),
+                                metadata={"held_qty": held_qty})
+                return None
             entry_price = float(existing.avg_entry_price)
-            log.info(f"Closing LONG {held_qty} {symbol} (signal). Going FLAT.")
-            close_order = submit(symbol, OrderSide.SELL, qty=held_qty, crypto=crypto)
+            log.info(f"Closing LONG {held_qty} {symbol} (signal, {session}). Going FLAT.")
+            close_order = submit(symbol, OrderSide.SELL, qty=held_qty, crypto=crypto, session=session)
             orders_placed.append(close_order)
             if not crypto:
                 record_day_trade()
@@ -801,6 +898,7 @@ async def lifespan(app: FastAPI):
     log.info(f"   Max hold             : {MAX_HOLD_DAYS} days")
     log.info(f"   Daily drawdown limit : -{DAILY_DRAWDOWN_LIMIT*100:.0f}%")
     log.info(f"   Trailing check       : every {TRAILING_CHECK_SEC}s")
+    log.info(f"   Extended hours       : {'ENABLED' if ENABLE_EXTENDED_HOURS else 'disabled'}")
     log.info(f"   Telegram             : {'ENABLED' if TELEGRAM_ENABLED else 'disabled'}")
 
     _load_state()
@@ -839,6 +937,8 @@ def health():
         return {
             "status"          : "ok",
             "mode"            : "LONG_ONLY_v2",
+            "extended_hours"  : ENABLE_EXTENDED_HOURS,
+            "current_session" : get_market_session(crypto=False),
             "market_open"     : clock.is_open,
             "next_open"       : str(clock.next_open),
             "buying_power"    : str(account.buying_power),
