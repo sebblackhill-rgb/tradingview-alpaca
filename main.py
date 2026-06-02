@@ -36,7 +36,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
@@ -956,7 +956,10 @@ def health():
 
 
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    # Validate fast (no network), ACK immediately, then do the heavy Alpaca
+    # work in the background. This guarantees TradingView always gets a quick
+    # 200 and never times out / auto-disables the alert.
     try:
         data = await request.json()
     except Exception:
@@ -972,10 +975,21 @@ async def webhook(request: Request):
     if missing:
         raise HTTPException(status_code=422, detail=f"Missing fields: {missing}")
 
-    notional = float(data["notional"]) if "notional" in data else None
-    qty      = float(data["qty"])      if "qty"      in data else None
+    background_tasks.add_task(_process_signal, data)
+    return JSONResponse({
+        "status"   : "accepted",
+        "symbol"   : data["symbol"],
+        "side"     : data["side"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
 
+
+def _process_signal(data: dict):
+    """Runs AFTER the 200 has already gone out. Does the actual order work.
+    Exceptions can't reach TradingView here, so we log + Telegram on failure."""
     try:
+        notional = float(data["notional"]) if "notional" in data else None
+        qty      = float(data["qty"])      if "qty"      in data else None
         order = place_order(
             symbol   = data["symbol"],
             side     = data["side"],
@@ -983,26 +997,17 @@ async def webhook(request: Request):
             qty      = qty,
         )
         if order is None:
-            return JSONResponse({"status": "skipped", "reason": "no action in long-only mode"})
-        return JSONResponse({
-            "status"      : "order_submitted",
-            "order_id"    : str(order.id),
-            "symbol"      : order.symbol,
-            "side"        : str(order.side),
-            "qty"         : str(order.qty),
-            "type"        : str(order.order_type),
-            "order_status": str(order.status),
-            "timestamp"   : datetime.now(timezone.utc).isoformat(),
-        })
-    except ValueError as e:
-        log.error(f"Validation error: {e}")
-        raise HTTPException(status_code=422, detail=str(e))
-    except RuntimeError as e:
-        log.error(f"Account error: {e}")
-        raise HTTPException(status_code=403, detail=str(e))
+            log.info(f"{data['symbol']} {data['side']}: no action (long-only/skip).")
+        else:
+            log.info(f"{data['symbol']} {data['side']}: order {order.id} submitted "
+                     f"({order.status}).")
     except Exception as e:
-        log.exception(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        log.exception(f"_process_signal failed for {data.get('symbol')}: {e}")
+        send_telegram(
+            f"⚠️ <b>TV Bot — signal FAILED</b>\n"
+            f"<b>{data.get('symbol')}</b> {data.get('side')}\n"
+            f"{type(e).__name__}: {e}"
+        )
 
 
 @app.get("/positions")
