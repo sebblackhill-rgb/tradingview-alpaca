@@ -71,6 +71,14 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 # Config — env vars
 # ──────────────────────────────────────────────
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean from an env var. Accepts 1/true/yes/on (any case).
+    Unset or blank -> default. Lets you flip behaviour from Railway, no redeploy."""
+    val = os.environ.get(name)
+    if val is None or val.strip() == "":
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
 ALPACA_API_KEY     = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY  = os.environ.get("ALPACA_SECRET_KEY", "")
 PAPER              = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
@@ -104,8 +112,16 @@ MAX_HOLD_DAYS        = 3         # close any position after N trading days
 DAILY_DRAWDOWN_LIMIT = 0.05      # 5% — auto-disable bot at this loss
 
 # EXTENDED HOURS — pre-market + after-hours trading
-ENABLE_EXTENDED_HOURS = True     # set False to revert to regular-hours-only
+# Now a Railway switch: set env var  ENABLE_EXTENDED_HOURS = false  for regular
+# hours only (this blocks the 16:00 ET close-bar buys). Default True = unchanged.
+ENABLE_EXTENDED_HOURS = _env_bool("ENABLE_EXTENDED_HOURS", True)
 EXT_LIMIT_BUFFER_PCT  = 0.01     # 1% limit-price buffer for extended-hours fills
+
+# EOD FLATTEN — optionally close all longs a few minutes before the regular close.
+# Off by default. Flip from Railway:  FLATTEN_AT_EOD = true  (and optionally
+# FLATTEN_BEFORE_CLOSE_MIN to set how many minutes before 16:00 ET it fires).
+FLATTEN_AT_EOD           = _env_bool("FLATTEN_AT_EOD", False)
+FLATTEN_BEFORE_CLOSE_MIN = int(os.environ.get("FLATTEN_BEFORE_CLOSE_MIN", "3"))
 
 # Where we persist the bot's trading-state snapshot (Railway ephemeral, OK)
 STATE_FILE           = Path("bot_state.json")
@@ -870,6 +886,38 @@ def _check_position_safeguards():
             log.error(f"Error processing {symbol}: {e}\n{traceback.format_exc()}")
 
 
+_eod_flatten_done_date = None  # guard so EOD flatten runs at most once per day
+
+
+def _maybe_flatten_eod():
+    """If FLATTEN_AT_EOD is on, close all LONG positions a few minutes before the
+    regular session close. Runs at most once per trading day. Never touches a
+    position the normal way you'd exit it — it just market-closes everything."""
+    global _eod_flatten_done_date
+    if not FLATTEN_AT_EOD:
+        return
+    try:
+        clock = client.get_clock()
+        if not clock.is_open:
+            return
+        mins_to_close = (clock.next_close - clock.timestamp).total_seconds() / 60.0
+        today = clock.timestamp.date()
+        if 0 < mins_to_close <= FLATTEN_BEFORE_CLOSE_MIN and _eod_flatten_done_date != today:
+            positions = client.get_all_positions()
+            longs = [p for p in positions if str(p.side).lower() == "long"]
+            log.info(f"EOD flatten: closing {len(longs)} long(s), {mins_to_close:.1f}m to close")
+            for p in longs:
+                try:
+                    _close_position_now(p.symbol, "eod_flatten")
+                except Exception as e:
+                    log.error(f"EOD flatten failed for {p.symbol}: {e}")
+            _eod_flatten_done_date = today
+            if longs:
+                send_telegram(f"🌆 <b>TV Bot — EOD flatten</b>\nClosed {len(longs)} position(s) before close.")
+    except Exception as e:
+        log.error(f"EOD flatten check error: {e}")
+
+
 def _background_loop():
     """Background thread — runs forever, checks safeguards every TRAILING_CHECK_SEC."""
     log.info(f"Background safeguard loop started (interval {TRAILING_CHECK_SEC}s)")
@@ -878,6 +926,7 @@ def _background_loop():
             _maybe_snapshot_starting_equity()
             _check_drawdown_halt()
             _check_position_safeguards()
+            _maybe_flatten_eod()
         except Exception as e:
             log.error(f"Background loop error: {e}")
             traceback.print_exc()
