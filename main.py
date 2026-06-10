@@ -123,6 +123,10 @@ EXT_LIMIT_BUFFER_PCT  = 0.01     # 1% limit-price buffer for extended-hours fill
 FLATTEN_AT_EOD           = _env_bool("FLATTEN_AT_EOD", False)
 FLATTEN_BEFORE_CLOSE_MIN = int(os.environ.get("FLATTEN_BEFORE_CLOSE_MIN", "3"))
 
+# DAILY SUMMARY — end-of-day Telegram recap (day P&L + open positions). On by default.
+DAILY_SUMMARY            = _env_bool("DAILY_SUMMARY", True)
+SUMMARY_BEFORE_CLOSE_MIN = int(os.environ.get("SUMMARY_BEFORE_CLOSE_MIN", "2"))
+
 # Where we persist the bot's trading-state snapshot (Railway ephemeral, OK)
 STATE_FILE           = Path("bot_state.json")
 
@@ -157,7 +161,9 @@ except Exception:
 journal = TradeJournal(
     bot_name="tradingview",
     account_id=_account_id,
-    journal_path=Path("trade_journal.json"),
+    # Set JOURNAL_PATH=/data/trade_journal.json + attach a Railway Volume at /data
+    # so the journal SURVIVES redeploys. Without a volume the file is wiped each deploy.
+    journal_path=Path(os.environ.get("JOURNAL_PATH", "trade_journal.json")),
 )
 
 # ──────────────────────────────────────────────
@@ -918,6 +924,49 @@ def _maybe_flatten_eod():
         log.error(f"EOD flatten check error: {e}")
 
 
+def _summary_text() -> str:
+    """Build a day-P&L + open-positions recap from the live Alpaca account."""
+    acct = client.get_account()
+    eq   = float(acct.equity)
+    last = float(acct.last_equity or eq)          # prior session close
+    day  = eq - last
+    pct  = (day / last * 100) if last else 0.0
+    positions = client.get_all_positions()
+    positions.sort(key=lambda p: -float(p.unrealized_pl))
+    if positions:
+        lines = "\n".join(
+            f"  {p.symbol}: {float(p.unrealized_pl):+,.0f} ({float(p.unrealized_plpc)*100:+.1f}%)"
+            for p in positions)
+    else:
+        lines = "  (flat)"
+    emoji = "🟢" if day >= 0 else "🔴"
+    return (f"{emoji} <b>TV Bot — Daily Summary</b>\n"
+            f"Day P&amp;L: <b>{day:+,.2f}</b> ({pct:+.2f}%)\n"
+            f"Equity: {eq:,.0f}\n"
+            f"Open positions ({len(positions)}):\n{lines}")
+
+
+_daily_summary_date = None  # guard so the summary fires once per day
+
+
+def _maybe_send_daily_summary():
+    """Send the EOD Telegram recap once per day, a few minutes before the close."""
+    global _daily_summary_date
+    if not DAILY_SUMMARY:
+        return
+    try:
+        clock = client.get_clock()
+        if not clock.is_open:
+            return
+        mins_to_close = (clock.next_close - clock.timestamp).total_seconds() / 60.0
+        today = clock.timestamp.date()
+        if 0 < mins_to_close <= SUMMARY_BEFORE_CLOSE_MIN and _daily_summary_date != today:
+            send_telegram(_summary_text())
+            _daily_summary_date = today
+    except Exception as e:
+        log.error(f"Daily summary error: {e}")
+
+
 def _background_loop():
     """Background thread — runs forever, checks safeguards every TRAILING_CHECK_SEC."""
     log.info(f"Background safeguard loop started (interval {TRAILING_CHECK_SEC}s)")
@@ -927,6 +976,7 @@ def _background_loop():
             _check_drawdown_halt()
             _check_position_safeguards()
             _maybe_flatten_eod()
+            _maybe_send_daily_summary()
         except Exception as e:
             log.error(f"Background loop error: {e}")
             traceback.print_exc()
@@ -1057,6 +1107,17 @@ def _process_signal(data: dict):
             f"<b>{data.get('symbol')}</b> {data.get('side')}\n"
             f"{type(e).__name__}: {e}"
         )
+
+
+@app.get("/summary")
+def summary_now():
+    """On-demand: push the day-P&L + positions recap to Telegram right now."""
+    try:
+        txt = _summary_text()
+        send_telegram(txt)
+        return {"sent": True, "text": txt}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/positions")
