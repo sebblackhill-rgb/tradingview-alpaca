@@ -100,8 +100,11 @@ MAX_NOTIONAL         = 5000
 PDT_WARN_LIMIT       = 3
 
 # TIER 2 — Stop loss settings
-STOP_LOSS_FIXED_PCT  = 0.03      # 3% below entry/peak
-STOP_LOSS_ATR_MULT   = 2.0       # 2x ATR below entry/peak
+# Trailing-stop geometry — env-configurable (Railway, no redeploy).
+# Defaults tuned from the 5-name exit study (Jun 2026): 8% / 3xATR, armed at +5%.
+STOP_LOSS_FIXED_PCT  = float(os.environ.get("TRAIL_STOP_PCT", "0.08"))   # was 0.03 -> 8% below peak
+STOP_LOSS_ATR_MULT   = float(os.environ.get("TRAIL_ATR_MULT", "3.0"))    # was 2.0  -> 3x ATR below peak
+TRAIL_ARM_PCT        = float(os.environ.get("TRAIL_ARM_PCT", "0.05"))    # arm stop only after +5% unrealised gain
 ATR_PERIOD           = 14
 ATR_TIMEFRAME_MIN    = 60        # 1H bars for ATR
 ATR_LOOKBACK_DAYS    = 10        # how many days of bars to fetch for ATR calc
@@ -296,11 +299,11 @@ def compute_atr(symbol: str, crypto: bool) -> Optional[float]:
 
 
 def compute_stop_price(symbol: str, entry_or_peak: float, crypto: bool) -> float:
-    """Stop = max(entry_or_peak - 3%, entry_or_peak - 2*ATR). WIDER wins."""
+    """Stop = wider of (peak - STOP_LOSS_FIXED_PCT) and (peak - STOP_LOSS_ATR_MULT*ATR)."""
     fixed_stop = entry_or_peak * (1 - STOP_LOSS_FIXED_PCT)
     atr = compute_atr(symbol, crypto)
     if atr is None:
-        log.info(f"{symbol}: ATR unavailable, using fixed 3% stop")
+        log.info(f"{symbol}: ATR unavailable, using fixed {STOP_LOSS_FIXED_PCT*100:.0f}% stop")
         return fixed_stop
     atr_stop = entry_or_peak - atr * STOP_LOSS_ATR_MULT
     chosen = min(fixed_stop, atr_stop)  # min = lower = WIDER stop
@@ -646,6 +649,7 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                         "atr": atr,
                         "opened_at": datetime.now(timezone.utc).isoformat(),
                         "entry_price": price,
+                        "armed": False,
                     }
                 _save_state()
                 # Journal: log ENTRY
@@ -852,6 +856,8 @@ def _check_position_safeguards():
                         # We don't know real opened_at; assume now (conservative — gives 3 days)
                         "opened_at": now.isoformat(),
                         "entry_price": entry_price,
+                        # Arm immediately only if already up +TRAIL_ARM_PCT at restart
+                        "armed": current_price >= entry_price * (1 + TRAIL_ARM_PCT),
                     }
                 _save_state()
                 log.info(f"Reconstructed trailing-stop state for {symbol} (server restart)")
@@ -866,14 +872,31 @@ def _check_position_safeguards():
                 _close_position_now(symbol, f"max hold ({MAX_HOLD_DAYS}d)")
                 continue
 
-            # TIER 2 — trailing stop
+            # TIER 2 — trailing stop (ARMED only after +TRAIL_ARM_PCT from entry)
             peak = state["peak_price"]
+            entry_ref = state.get("entry_price", peak)
+            armed = state.get("armed", False)
+
+            # Arm once the peak has reached entry * (1 + TRAIL_ARM_PCT). Until armed,
+            # the stop is tracked but NEVER enforced — this stops the bot exiting on
+            # noise near entry; the TradingView UT_SELL handles early exits (~89% of
+            # closes in backtest). The stop is a parachute for the ~11% tail / gaps.
+            if not armed and peak >= entry_ref * (1 + TRAIL_ARM_PCT):
+                armed = True
+                with _state_lock:
+                    _state["trailing_stops"][symbol]["armed"] = True
+                _save_state()
+                log.info(
+                    f"{symbol}: trailing stop ARMED — peak ${peak:.2f} reached "
+                    f"+{TRAIL_ARM_PCT*100:.0f}% of entry ${entry_ref:.2f}"
+                )
+
             if current_price > peak:
-                # Move stop up (ratchet)
+                # Move stop up (ratchet). Peak tracks even before arming so the
+                # stop is already at the right level the moment it arms.
                 new_stop = compute_stop_price(symbol, current_price, crypto)
-                # Stop only ever moves UP — never down
                 old_stop = state["stop_price"]
-                new_stop = max(new_stop, old_stop)
+                new_stop = max(new_stop, old_stop)  # stop only ever moves UP
                 with _state_lock:
                     _state["trailing_stops"][symbol]["peak_price"] = current_price
                     _state["trailing_stops"][symbol]["stop_price"] = new_stop
@@ -881,12 +904,14 @@ def _check_position_safeguards():
                 log.info(
                     f"{symbol}: peak ${peak:.2f} → ${current_price:.2f} | "
                     f"stop ${old_stop:.2f} → ${new_stop:.2f}"
+                    f"{'' if armed else '  (not yet armed - not enforced)'}"
                 )
 
-            # Check if stop is hit
-            stop_price = state["stop_price"]
-            if current_price <= stop_price:
-                _close_position_now(symbol, f"trailing stop @ ${stop_price:.2f}")
+            # Enforce the stop ONLY once armed.
+            if armed:
+                stop_price = state["stop_price"]
+                if current_price <= stop_price:
+                    _close_position_now(symbol, f"trailing stop @ ${stop_price:.2f}")
 
         except Exception as e:
             log.error(f"Error processing {symbol}: {e}\n{traceback.format_exc()}")
@@ -994,6 +1019,7 @@ async def lifespan(app: FastAPI):
     log.info(f"   Max cap              : ${MAX_NOTIONAL}")
     log.info(f"   Stop loss (fixed)    : -{STOP_LOSS_FIXED_PCT*100:.0f}%")
     log.info(f"   Stop loss (ATR)      : {STOP_LOSS_ATR_MULT}x")
+    log.info(f"   Trailing arm at      : +{TRAIL_ARM_PCT*100:.0f}% (stop enforced only above this gain)")
     log.info(f"   Max hold             : {MAX_HOLD_DAYS} days")
     log.info(f"   Daily drawdown limit : -{DAILY_DRAWDOWN_LIMIT*100:.0f}%")
     log.info(f"   Trailing check       : every {TRAILING_CHECK_SEC}s")
