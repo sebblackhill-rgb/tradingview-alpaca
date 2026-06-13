@@ -49,6 +49,7 @@ from alpaca.data.requests import (
     StockBarsRequest, CryptoBarsRequest,
 )
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.enums import DataFeed
 
 import requests as http_requests
 
@@ -107,7 +108,11 @@ STOP_LOSS_ATR_MULT   = float(os.environ.get("TRAIL_ATR_MULT", "3.0"))    # was 2
 TRAIL_ARM_PCT        = float(os.environ.get("TRAIL_ARM_PCT", "0.05"))    # arm stop only after +5% unrealised gain
 ATR_PERIOD           = 14
 ATR_TIMEFRAME_MIN    = 60        # 1H bars for ATR
-ATR_LOOKBACK_DAYS    = 10        # how many days of bars to fetch for ATR calc
+ATR_LOOKBACK_DAYS    = 15        # days of bars to fetch for ATR calc (widened from 10)
+# Stock data feed for ATR history. Paper/free accounts must use IEX;
+# set ALPACA_DATA_FEED=sip if you have the paid SIP subscription.
+_FEED_NAME    = os.environ.get("ALPACA_DATA_FEED", "iex").lower()
+ATR_DATA_FEED = DataFeed.SIP if _FEED_NAME == "sip" else DataFeed.IEX
 TRAILING_CHECK_SEC   = 60        # how often to check trailing stops
 
 # TIER 3 — Max hold + drawdown
@@ -274,10 +279,16 @@ def compute_atr(symbol: str, crypto: bool) -> Optional[float]:
             req = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, end=end)
             bars = crypto_data_client.get_crypto_bars(req).df
         else:
-            req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, end=end)
+            req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf,
+                                   start=start, end=end, feed=ATR_DATA_FEED)
             bars = stock_data_client.get_stock_bars(req).df
 
-        if bars is None or bars.empty or len(bars) < ATR_PERIOD + 1:
+        n = 0 if bars is None else len(bars)
+        if bars is None or bars.empty or n < ATR_PERIOD + 1:
+            log.warning(
+                f"ATR {symbol}: insufficient bars (got {n}, need {ATR_PERIOD + 1}) "
+                f"on {ATR_TIMEFRAME_MIN}m feed={_FEED_NAME} -> using fixed-pct floor"
+            )
             return None
         bars = bars.reset_index()
 
@@ -663,16 +674,14 @@ def place_order(symbol: str, side: str, notional: float = None, qty: float = Non
                         "crypto": crypto,
                     },
                 )
+                stop_pct = (stop / price - 1) * 100
+                atr_line = f"\nATR: {atr:.4f}" if atr else "\nATR: n/a (using fixed % floor)"
                 send_telegram(
                     f"🟢 <b>TV Bot — LONG opened</b>\n"
                     f"<b>{symbol}</b> @ ${price:.2f}\n"
                     f"Notional: ${spend:.0f}\n"
-                    f"Trailing stop: ${stop:.2f} ({(stop/price - 1)*100:.2f}%)\n"
-                    f"ATR: {atr:.4f}" if atr else
-                    f"🟢 <b>TV Bot — LONG opened</b>\n"
-                    f"<b>{symbol}</b> @ ${price:.2f}\n"
-                    f"Notional: ${spend:.0f}\n"
-                    f"Trailing stop: ${stop:.2f} (fixed 3%)"
+                    f"Trailing stop: ${stop:.2f} ({stop_pct:.1f}%, arms at +{TRAIL_ARM_PCT*100:.0f}%)"
+                    f"{atr_line}"
                 )
             except Exception as e:
                 log.warning(f"Could not initialize trailing stop for {symbol}: {e}")
