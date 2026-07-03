@@ -116,7 +116,7 @@ ATR_DATA_FEED = DataFeed.SIP if _FEED_NAME == "sip" else DataFeed.IEX
 TRAILING_CHECK_SEC   = 60        # how often to check trailing stops
 
 # TIER 3 — Max hold + drawdown
-MAX_HOLD_DAYS        = 3         # close any position after N trading days
+MAX_HOLD_DAYS        = 7         # close any position after N trading days
 DAILY_DRAWDOWN_LIMIT = 0.05      # 5% — auto-disable bot at this loss
 
 # EXTENDED HOURS — pre-market + after-hours trading
