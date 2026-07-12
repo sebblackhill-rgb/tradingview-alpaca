@@ -90,6 +90,7 @@ IS_PAPER           = "paper" in PAPER
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+BOT_TAG            = os.environ.get("BOT_TAG", "TV")   # e.g. B / C / FADE / FLAG — tags every Telegram line
 
 # ──────────────────────────────────────────────
 # Risk settings
@@ -116,7 +117,7 @@ ATR_DATA_FEED = DataFeed.SIP if _FEED_NAME == "sip" else DataFeed.IEX
 TRAILING_CHECK_SEC   = 60        # how often to check trailing stops
 
 # TIER 3 — Max hold + drawdown
-MAX_HOLD_DAYS        = 7         # close any position after N trading days
+MAX_HOLD_DAYS        = int(os.environ.get("MAX_HOLD_DAYS", "7"))   # per-service override (Railway)
 DAILY_DRAWDOWN_LIMIT = 0.05      # 5% — auto-disable bot at this loss
 
 # EXTENDED HOURS — pre-market + after-hours trading
@@ -217,6 +218,7 @@ def _save_state():
 def send_telegram(text: str, parse_mode: str = "HTML"):
     if not TELEGRAM_ENABLED:
         return
+    text = f"[{BOT_TAG}] " + text
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         http_requests.post(url, data={
@@ -274,7 +276,12 @@ def compute_atr(symbol: str, crypto: bool) -> Optional[float]:
     try:
         end = datetime.now(timezone.utc) - timedelta(minutes=2)
         start = end - timedelta(days=ATR_LOOKBACK_DAYS)
-        tf = TimeFrame(ATR_TIMEFRAME_MIN, TimeFrameUnit.Minute)
+        # alpaca-py restricts Minute units to 1-59; express 60m as 1 Hour instead
+        # (was: TimeFrame(ATR_TIMEFRAME_MIN, TimeFrameUnit.Minute) — broke after a
+        # library upgrade, silently degraded every stop to the fixed-% floor)
+        tf = (TimeFrame(ATR_TIMEFRAME_MIN // 60, TimeFrameUnit.Hour)
+              if ATR_TIMEFRAME_MIN % 60 == 0
+              else TimeFrame(ATR_TIMEFRAME_MIN, TimeFrameUnit.Minute))
         if crypto:
             req = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, end=end)
             bars = crypto_data_client.get_crypto_bars(req).df
@@ -557,9 +564,58 @@ def wait_for_fill(order_id: str, max_wait_seconds: int = 8) -> bool:
 
 
 # ──────────────────────────────────────────────
+# Duplicate-delivery guard (Jul 2026)
+# TradingView can deliver the same alert twice (duplicate alerts on a symbol,
+# or a webhook retry). Both copies used to pass the "already long?" check
+# before either filled -> double fill (MRAM 2x $2k, Jul 06). Serialise per
+# (symbol, side): if an identical signal is already in flight, skip this one.
+# ──────────────────────────────────────────────
+_inflight_lock = threading.Lock()
+_inflight: dict = {}                 # (symbol, side) -> monotonic start time
+INFLIGHT_STALE_SEC = 120             # safety valve if a thread ever hangs
+
+
+def _try_acquire_inflight(key) -> bool:
+    now = time.monotonic()
+    with _inflight_lock:
+        ts = _inflight.get(key)
+        if ts is not None and (now - ts) < INFLIGHT_STALE_SEC:
+            return False             # identical signal already being processed
+        _inflight[key] = now         # acquire (or steal a stale entry)
+        return True
+
+
+def _release_inflight(key):
+    with _inflight_lock:
+        _inflight.pop(key, None)
+
+
+def place_order(symbol: str, side: str, notional: float = None, qty: float = None):
+    """Wrapper: duplicate-delivery guard around the real order logic."""
+    key = (normalize_symbol(symbol), side.lower().strip())
+    if not _try_acquire_inflight(key):
+        log.warning(f"DUPLICATE signal skipped — {key[1].upper()} {key[0]} already in flight.")
+        send_telegram(
+            f"⛔️ <b>TV Bot — duplicate skipped</b>\n"
+            f"<b>{key[0]}</b> {key[1].upper()} (identical signal already in flight — "
+            f"check for a duplicate alert on this symbol)"
+        )
+        try:
+            journal.log_skip(key[0], "duplicate_inflight", price=0.0,
+                             metadata={"side": key[1]})
+        except Exception:
+            pass
+        return None
+    try:
+        return _place_order_impl(symbol, side, notional=notional, qty=qty)
+    finally:
+        _release_inflight(key)
+
+
+# ──────────────────────────────────────────────
 # Core order logic — LONG ONLY
 # ──────────────────────────────────────────────
-def place_order(symbol: str, side: str, notional: float = None, qty: float = None):
+def _place_order_impl(symbol: str, side: str, notional: float = None, qty: float = None):
     symbol = normalize_symbol(symbol)
     side   = side.lower().strip()
     if side not in ("buy", "sell"):
@@ -1142,6 +1198,34 @@ def _process_signal(data: dict):
             f"<b>{data.get('symbol')}</b> {data.get('side')}\n"
             f"{type(e).__name__}: {e}"
         )
+
+
+@app.get("/journal")
+def get_journal(limit: int = 200):
+    """Read this bot's trade journal file (JOURNAL_PATH) and return it.
+    Schema-agnostic: whatever TradeJournal wrote to disk is returned as-is,
+    plus a best-effort recent-entries slice and P&L tally if the shape looks
+    like a list of {..., 'pnl': ...} records."""
+    path = Path(os.environ.get("JOURNAL_PATH", "trade_journal.json"))
+    if not path.exists():
+        return {"bot_tag": BOT_TAG, "path": str(path), "note": "journal file not found yet — no trades logged"}
+    try:
+        raw = json.loads(path.read_text())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not parse {path}: {e}")
+
+    result = {"bot_tag": BOT_TAG, "path": str(path)}
+    entries = raw if isinstance(raw, list) else raw.get("entries") if isinstance(raw, dict) else None
+    if isinstance(entries, list):
+        result["count"] = len(entries)
+        result["recent"] = entries[-limit:]
+        pnls = [e.get("pnl") for e in entries if isinstance(e, dict) and isinstance(e.get("pnl"), (int, float))]
+        if pnls:
+            result["net_pnl_logged"] = round(sum(pnls), 2)
+            result["closed_trades_with_pnl"] = len(pnls)
+    else:
+        result["raw"] = raw   # unrecognised shape — hand back everything, unfiltered
+    return result
 
 
 @app.get("/summary")
